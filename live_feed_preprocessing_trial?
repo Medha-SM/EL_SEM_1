@@ -1,0 +1,122 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+from PIL import Image
+from scipy.ndimage import gaussian_filter
+import time
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# Load YOLO model
+# -----------------------------
+model = YOLO("yolov8n.pt")
+
+# -----------------------------
+# Video source (0 = webcam)
+# Replace with sensor feed URL/path
+# -----------------------------
+video = cv2.VideoCapture(0)
+
+FRAME_INTERVAL = 5   # seconds between captures
+last_capture_time = 0
+
+print("Starting live processing... Press 'q' to exit.")
+
+while True:
+    ret, frame = video.read()
+    if not ret:
+        print("Error: No frame received from video stream.")
+        break
+
+    current_time = time.time()
+
+    # -----------------------------
+    # Process a frame every 5 seconds
+    # -----------------------------
+    if current_time - last_capture_time >= FRAME_INTERVAL:
+        last_capture_time = current_time
+
+        print(f"\n[INFO] Frame captured at {time.strftime('%H:%M:%S')}")
+
+        # Convert BGR → RGB for YOLO + PIL
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # -----------------------------
+        # YOLO Inference
+        # -----------------------------
+        results = model.predict(frame_rgb, verbose=False)
+        annotation_points = []
+
+        # Extract centers for persons
+        for r in results:
+            if r.boxes is None:
+                continue
+
+            for box in r.boxes:
+                cls = int(box.cls[0])
+                if cls == 0:  # person class
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    cx = (x1 + x2) / 2
+                    cy = (y1 + y2) / 2
+                    annotation_points.append([cx, cy])
+
+        print("Persons detected:", len(annotation_points))
+
+        # -----------------------------
+        # CSRNet Preprocessing
+        # -----------------------------
+        orig_h, orig_w = frame_rgb.shape[:2]
+
+        # Resize image for CSRNet
+        resized_img = cv2.resize(frame_rgb, (256, 256))
+        resized_img = resized_img.astype(np.float32) / 255.0
+
+        # Scale factors
+        scale_x = 256 / orig_w
+        scale_y = 256 / orig_h
+
+        # Create ground-truth dot map
+        gt = np.zeros((256, 256), dtype=np.float32)
+
+        for pt in annotation_points:
+            x = int(pt[0] * scale_x)
+            y = int(pt[1] * scale_y)
+
+            if 0 <= x < 256 and 0 <= y < 256:
+                gt[y, x] = 1
+
+        # Apply Gaussian filter to create density map
+        density_map = gaussian_filter(gt, sigma=4)
+
+        # -----------------------------
+        # Display Results
+        # -----------------------------
+        plt.figure(figsize=(10, 4))
+
+        # Image + annotation points
+        plt.subplot(1, 2, 1)
+        plt.imshow(resized_img)
+        if len(annotation_points) > 0:
+            pts_x = [p[0] * scale_x for p in annotation_points]
+            pts_y = [p[1] * scale_y for p in annotation_points]
+            plt.scatter(pts_x, pts_y, c='red', s=10)
+        plt.title("Processed Frame")
+
+        # Density map
+        plt.subplot(1, 2, 2)
+        plt.imshow(density_map, cmap='jet')
+        plt.title("Density Map")
+
+        plt.tight_layout()
+        plt.show()
+
+    # -----------------------------
+    # Live Video Preview
+    # -----------------------------
+    cv2.imshow("Live Feed", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Cleanup
+video.release()
+cv2.destroyAllWindows()
