@@ -1,111 +1,136 @@
+"""
+IR-ONLY DENSITY STITCHER
+
+This version assumes:
+  • ALL input images are IR (colorized thermal)
+  • No RGB detection
+  • No RGB segmentation options
+  • Uses ir_to_density() exclusively
+  • Homographies or placements may be provided
+
+Usage:
+python final_stitcher_ir_only.py --images camA.png camC.png --Hs H_A.npy H_C.npy
+python final_stitcher_ir_only.py --images camA.png camC.png --placements 50,200 800,200
+"""
+
+import argparse
 import cv2
 import numpy as np
-from scipy.ndimage import gaussian_filter
 from matplotlib import cm
+from PIL import Image
+import os
+import sys
 
-# ============================================================
-# 1. LOAD REAL INFRARED IMAGES (grayscale IR)
-# ============================================================
-camA = cv2.imread("camA_ir.png", cv2.IMREAD_ANYDEPTH)
-camC = cv2.imread("camC_ir.png", cv2.IMREAD_ANYDEPTH)
+# ---------- IR → Density ----------
+def ir_to_density(img_bgr):
+    """Convert colorized IR image to density map."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray = (gray - gray.min()) / (gray.max() - gray.min() + 1e-9)
 
-# Normalize if 16-bit IR
-def normalize(img):
-    img = img.astype("float32")
-    img -= img.min()
-    img /= (img.max() + 1e-6)
-    return img
-
-camA = normalize(camA)
-camC = normalize(camC)
-
-# Load top-down venue image
-topdown = cv2.imread("topdown.png")
-h_top, w_top = topdown.shape[:2]
-
-
-# ============================================================
-# 2. HUMAN ISOLATION IN REAL IR
-#    (thermal thresholding + morphological shaping)
-# ============================================================
-def ir_people_mask(img):
-    """
-    Segment people from real IR by using heat signatures.
-    Higher intensities = hotter = people.
-    """
-
-    # Adaptive threshold (robust for varying lighting)
     thr = cv2.adaptiveThreshold(
-        (img * 255).astype("uint8"),
-        255,
+        (gray * 255).astype(np.uint8), 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        51,
-        -5
+        cv2.THRESH_BINARY, 51, -5
     )
 
-    # Clean noise
     kernel = np.ones((5,5), np.uint8)
     thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel)
     thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel)
 
-    return thr
-
-
-maskA = ir_people_mask(camA)
-maskC = ir_people_mask(camC)
-
-
-# ============================================================
-# 3. MAKE TRUE DENSITY MAPS (Gaussian kernel per pixel)
-# ============================================================
-def make_density(mask):
-    """
-    Convert binary mask to density map with spatial smoothing.
-    """
-    density = mask.astype("float32") / 255.0
-    # Spread the density (simulates real model output)
-    density = gaussian_filter(density, sigma=8)
+    density = cv2.GaussianBlur(thr.astype(np.float32)/255.0, (0,0), sigmaX=8, sigmaY=8)
     return density
 
-densityA = make_density(maskA)
-densityC = make_density(maskC)
+# ---------- Heatmap Coloring ----------
+def heatmap_to_color(density, cmap_name='inferno'):
+    if density.max() > 0:
+        norm = (density - density.min()) / (density.max() - density.min())
+    else:
+        norm = density
+    cmap = cm.get_cmap(cmap_name)
+    rgba = cmap(norm)
+    rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
+# ---------- Stitcher ----------
+def stitch_densities(densities, H_files=None, placements=None, topdown_image=None):
+    # Determine canvas size
+    if topdown_image is not None:
+        canvas_h, canvas_w = topdown_image.shape[:2]
+    else:
+        if placements:
+            canvas_w = max(x + dens.shape[1] for (x, y), dens in zip(placements, densities)) + 50
+            canvas_h = max(y + dens.shape[0] for (x, y), dens in zip(placements, densities)) + 50
+        else:
+            maxh = max(d.shape[0] for d in densities)
+            sumw = sum(d.shape[1] for d in densities)
+            canvas_h = maxh + 100
+            canvas_w = int(sumw * 0.75) + 200
 
-# ============================================================
-# 4. LOAD HOMOGRAPHIES + WARP TO TOP-DOWN COORDINATES
-# ============================================================
-H_A = np.load("H_A.npy")
-H_C = np.load("H_C.npy")
+    master = np.zeros((canvas_h, canvas_w), dtype=np.float32)
 
-warpedA = cv2.warpPerspective(densityA, H_A, (w_top, h_top))
-warpedC = cv2.warpPerspective(densityC, H_C, (w_top, h_top))
+    # Warp using homographies if provided
+    if H_files:
+        for dens, Hf in zip(densities, H_files):
+            H = np.load(Hf)
+            warped = cv2.warpPerspective(dens, H, (canvas_w, canvas_h), flags=cv2.INTER_LINEAR)
+            master += warped
+    else:
+        for dens, (x_off, y_off) in zip(densities, placements):
+            h,w = dens.shape
+            x1, y1 = int(x_off), int(y_off)
+            x2, y2 = x1 + w, y1 + h
+            master[y1:y2, x1:x2] += dens
 
+    return master
 
-# ============================================================
-# 5. CREATE MASTER DENSITY MAP
-# ============================================================
-master_density = warpedA + warpedC
-master_density = np.clip(master_density, 0, None)
+# ---------- MAIN ----------
+def main():
+    parser = argparse.ArgumentParser(description="IR-only multi-camera heatmap stitcher.")
+    parser.add_argument("--images", nargs="+", required=True, help="Input IR camera images.")
+    parser.add_argument("--topdown", default=None, help="Optional background image.")
+    parser.add_argument("--Hs", nargs="*", default=None, help="Homography .npy files.")
+    parser.add_argument("--placements", nargs="*", default=None, help="Manual placements x,y.")
+    parser.add_argument("--out-prefix", default="master_ir", help="Output prefix.")
+    args = parser.parse_args()
 
-np.save("master_density.npy", master_density)
+    densities = []
+    for img_path in args.images:
+        img = cv2.imread(img_path)
+        if img is None:
+            print("ERROR loading:", img_path)
+            sys.exit(1)
+        dens = ir_to_density(img)
+        densities.append(dens)
 
+    # Load topdown if provided
+    topdown_img = cv2.imread(args.topdown) if args.topdown else None
 
-# ============================================================
-# 6. GENERATE VISUAL HEATMAPS
-# ============================================================
-def heat_overlay(base_img, density):
-    d = density / (density.max() + 1e-6)
-    heat = (cm.inferno(d)[:, :, :3] * 255).astype("uint8")
-    heat = cv2.cvtColor(heat, cv2.COLOR_RGB2BGR)
-    return cv2.addWeighted(base_img, 0.55, heat, 0.75, 0)
+    # Parse placements
+    placements = None
+    if args.placements:
+        placements = [tuple(map(int, p.split(","))) for p in args.placements]
 
+    # Stitch
+    master = stitch_densities(
+        densities,
+        H_files=args.Hs,
+        placements=placements,
+        topdown_image=topdown_img
+    )
 
-# Individual camera heatmaps
-cv2.imwrite("heat_camA.png", heat_overlay(topdown, warpedA))
-cv2.imwrite("heat_camC.png", heat_overlay(topdown, warpedC))
+    np.save(f"{args.out_prefix}_density.npy", master.astype(np.float32))
 
-# Final master heatmap
-cv2.imwrite("heat_master.png", heat_overlay(topdown, master_density))
+    # Visualization
+    heat = heatmap_to_color(master)
 
-print("✓ Generated: heat_camA.png, heat_camC.png, heat_master.png")
+    if topdown_img is not None:
+        base = cv2.resize(topdown_img, (heat.shape[1], heat.shape[0]))
+        overlay = cv2.addWeighted(base, 0.6, heat, 0.6, 0)
+        cv2.imwrite(f"{args.out_prefix}_heatmap.png", overlay)
+    else:
+        cv2.imwrite(f"{args.out_prefix}_heatmap.png", heat)
+
+    print("Saved:", f"{args.out_prefix}_heatmap.png", f"{args.out_prefix}_density.npy")
+
+if __name__ == "__main__":
+    main()
