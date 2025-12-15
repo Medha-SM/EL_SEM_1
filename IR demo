@@ -1,0 +1,115 @@
+import cv2
+import time
+import numpy as np
+from ultralytics import YOLO
+
+# ================= CONFIG =================
+CAMERA_INDEX = 0
+ALERT_THRESHOLD = 1
+CONF_THRESHOLD = 0.4
+
+HEAT_DECAY = 0.95
+HEAT_INCREMENT = 20
+
+# ================= LOAD YOLO =================
+model = YOLO("yolov8n.pt")
+
+# ================= CAMERA =================
+cap = cv2.VideoCapture(CAMERA_INDEX)
+if not cap.isOpened():
+    raise RuntimeError("Camera not accessible")
+
+print("✅ Human Crowd Counter with Tracking Started")
+
+prev_time = time.time()
+heat_accumulator = None
+
+# Store active unique IDs
+active_ids = set()
+
+# ================= LOOP =================
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.resize(frame, (960, 540))
+
+    if heat_accumulator is None:
+        heat_accumulator = np.zeros(frame.shape[:2], dtype=np.float32)
+
+    # ================= YOLO + TRACKING =================
+    results = model.track(
+        frame,
+        conf=CONF_THRESHOLD,
+        classes=[0],   # person
+        persist=True, # keeps IDs across frames
+        verbose=False
+    )
+
+    # Fade old heat
+    heat_accumulator *= HEAT_DECAY
+
+    current_ids = set()
+
+    for r in results:
+        if r.boxes is None or r.boxes.id is None:
+            continue
+
+        boxes = r.boxes.xyxy.cpu().numpy()
+        ids = r.boxes.id.cpu().numpy().astype(int)
+
+        for (box, track_id) in zip(boxes, ids):
+            x1, y1, x2, y2 = map(int, box)
+            current_ids.add(track_id)
+
+            # Add heat
+            heat_accumulator[y1:y2, x1:x2] += HEAT_INCREMENT
+
+    # Update active IDs
+    active_ids = current_ids
+    people_count = len(active_ids)
+
+    # ================= HEATMAP =================
+    heat_norm = cv2.normalize(
+        heat_accumulator, None, 0, 255, cv2.NORM_MINMAX
+    ).astype(np.uint8)
+
+    heatmap = cv2.applyColorMap(heat_norm, cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(frame, 0.6, heatmap, 0.4, 0)
+
+    # ================= ALERT =================
+    if people_count > ALERT_THRESHOLD:
+        status = "ALERT"
+        color = (0, 0, 255)
+    else:
+        status = "SAFE"
+        color = (0, 255, 0)
+
+    # ================= FPS =================
+    curr_time = time.time()
+    fps = 1.0 / max(curr_time - prev_time, 1e-6)
+    prev_time = curr_time
+
+    # ================= DISPLAY =================
+    cv2.putText(
+        overlay, f"People (Tracked): {people_count}",
+        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2
+    )
+    cv2.putText(
+        overlay, f"Status: {status}",
+        (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2
+    )
+    cv2.putText(
+        overlay, f"FPS: {fps:.1f}",
+        (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2
+    )
+
+    cv2.imshow("Human Crowd Counter (Occlusion-Resistant)", overlay)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+print("🛑 System Stopped")
